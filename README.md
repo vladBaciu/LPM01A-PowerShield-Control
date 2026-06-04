@@ -1,5 +1,12 @@
 # LPM01A-lib
 
+## Changes compared to fork
+
+Add Static Mode Sampling with Continuous Capture Loop
+
+Problem:
+The original static mode implementation returns only a single sample per capture, which is insufficient for devices with constant power consumption above 10mA. The LPM01A device is designed to measure currents in the range [2nA, 200mA], and devices in the higher consumption range require multiple consecutive measurements to characterize power behavior accurately.
+
 ## Description
 
 This is a Python library for the [X-NUCLEO-LPM01A](https://www.st.com/en/evaluation-tools/x-nucleo-lpm01a.html) STM32 Power shield, Nucleo expansion board for power consumption measurement.
