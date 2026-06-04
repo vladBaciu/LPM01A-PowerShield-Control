@@ -3,6 +3,8 @@ import pandas as pd
 from time import time
 import re
 import shutil
+import tempfile
+import os
 from src.UnitConversions import UnitConversions
 
 
@@ -33,8 +35,6 @@ class DataAnalysis:
         r"# Average current consumption: ([\d.]+(?:e[+-]?\d+)?) Ah \(([\d.]+(?:e[+-]?\d+)?) mAh\)"
         r"##########################################################################################################"
     )
-
-    TEMP_FILE_PATH = "/tmp/temp.csv"
 
     def __init__(
         self,
@@ -130,9 +130,13 @@ class DataAnalysis:
             f"##########################################################################################################\n"
         )
 
+        # Create a temporary file in the same directory as the CSV file
+        csv_dir = os.path.dirname(self.csv_file_path)
+        temp_file_path = os.path.join(csv_dir, "temp.csv")
+
         # Open the existing file and the temporary file
         with open(self.csv_file_path, "r") as source_file, open(
-            self.TEMP_FILE_PATH, "w"
+            temp_file_path, "w"
         ) as temp_file:
             # Write the new data to the temporary file
             temp_file.write(cache_data_str)
@@ -140,7 +144,7 @@ class DataAnalysis:
             # Copy the existing content of the file to the temporary file
             shutil.copyfileobj(source_file, temp_file)
         # Replace the original file with the temporary file
-        shutil.move(self.TEMP_FILE_PATH, self.csv_file_path)
+        shutil.move(temp_file_path, self.csv_file_path)
 
     def calculate_average_current(self) -> float:
         """Calculates the average current consumption in Ah.
@@ -207,7 +211,13 @@ class DataAnalysis:
 
         Returns:
             float: The time slice in seconds.
+            
+        Raises:
+            ValueError: If the CSV file contains no data rows.
         """
+        if len(self.filtered_df) == 0:
+            raise ValueError("CSV file contains no data rows. Please check the file or verify that data was captured.")
+        
         return self.uc.us_to_s(
             self.filtered_df["rx timestamp (us)"].iloc[-1]
             - self.filtered_df["rx timestamp (us)"].iloc[0]
