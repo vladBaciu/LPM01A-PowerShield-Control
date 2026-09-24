@@ -1,10 +1,14 @@
 from time import sleep
-from time import time
+from time import time, monotonic
 from enum import Enum
 import re
 from src.SerialCommunication import SerialCommunication
 from src.CsvWriter import CsvWriter
 from src.UnitConversions import UnitConversions
+
+
+class StaticCurrentUnstableError(RuntimeError):
+    """The device rejected a static measurement because current varied."""
 
 
 class LPM01A:
@@ -78,20 +82,46 @@ class LPM01A:
         except (ValueError, IndexError):
             return None
 
-    def _read_and_parse_ascii_single_sample(self) -> bool:
+    @staticmethod
+    def _is_device_error(response: str) -> bool:
+        return response.lstrip("\x00 \t").lower().startswith(
+            ("error:", "powershield > error")
+        )
+
+    def _read_and_parse_ascii_single_sample(self, timeout_s: float = 30) -> bool:
         """
         Reads and parses a single sample from the LPM01A device in ASCII mode (for static mode).
         
         Returns:
             bool: True if a sample was successfully read and written to CSV, False otherwise.
         """
-        timeout_start = time()
-        timeout_s = 30  # 30 second timeout for single sample
+        timeout_start = monotonic()
+        pending_sample = None
         
-        while time() - timeout_start < timeout_s:
+        while monotonic() - timeout_start < timeout_s:
             response = self.serial_comm.receive_data()
             if not response:
                 continue
+            if self._is_device_error(response):
+                if "static acquisition: current not constant" in response.lower():
+                    raise StaticCurrentUnstableError(
+                        f"Measurement rejected by device; no sample saved: {response}"
+                    )
+                raise RuntimeError(f"Measurement rejected by device; no sample saved: {response}")
+
+            if response == "PowerShield > Acquisition completed":
+                if pending_sample is None:
+                    raise RuntimeError("Static acquisition completed without a current sample")
+                current, local_timestamp_us = pending_sample
+                self.csv_writer.write(
+                    f"{current},{local_timestamp_us},{self.board_timestamp_ms}\n"
+                )
+                self.num_of_captured_values += 1
+                print(
+                    f"Sample captured: {current} uA at {self.uc.us_to_ms(local_timestamp_us)} ms\n"
+                    f"Total samples: {self.num_of_captured_values}\n"
+                )
+                return True
 
             if "TimeStamp:" in response:
                 try:
@@ -113,28 +143,22 @@ class LPM01A:
                 local_timestamp_us = (
                     int(self.uc.s_to_us(time())) - self.capture_start_us
                 )
-                self.csv_writer.write(
-                    f"{current},{local_timestamp_us},{self.board_timestamp_ms}\n"
-                )
-                self.num_of_captured_values += 1
-                print(
-                    f"Sample captured: {current} uA at {self.uc.us_to_ms(local_timestamp_us)} ms\n"
-                    f"Total samples: {self.num_of_captured_values}\n"
-                    f"Board buffer usage: {self.board_buffer_usage_percentage}%\n"
-                )
-                return True
+                pending_sample = (current, local_timestamp_us)
         
-        print(f"Timeout: No sample received within {timeout_s} seconds")
+        print(f"Timeout: No completed static measurement within {timeout_s} seconds")
         return False
 
-    def _read_and_parse_ascii(self) -> None:
+    def _read_and_parse_ascii(self, duration_s: float = None) -> None:
         """
         Reads and parses the data from the LPM01A device in ASCII mode (continuous mode).
         """
-        while True:
+        deadline = None if duration_s is None else monotonic() + duration_s
+        while deadline is None or monotonic() < deadline:
             response = self.serial_comm.receive_data()
             if not response:
                 continue
+            if self._is_device_error(response):
+                raise RuntimeError(f"Acquisition stopped by device: {response}")
 
             if "TimeStamp:" in response:
                 try:
@@ -189,33 +213,45 @@ class LPM01A:
         """
         Sends a command to the LPM01A device and waits for a response.
 
-        Args:
-            command (str): The command to send to the LPM01A device.
-            expected_response (str): The expected response from the LPM01A device.
-            timeout_s (int): The timeout in seconds to wait for a response.
-
-        Returns:
-            bool: True if the command was successful, False otherwise.
+        This device emits both command acknowledgements and measurement summary lines.
+        We therefore accept either the command-specific ack or the summary-finalization
+        line for stop/measurement completion instead of assuming a single exact reply.
         """
+        if self.serial_comm.ser and self.serial_comm.ser.is_open:
+            self.serial_comm.ser.reset_input_buffer()
+
         tick_start = time()
         self.serial_comm.send_data(command)
         while time() - tick_start < timeout_s:
             response = self.serial_comm.receive_data()
-            if response == "":
+            if not response:
                 continue
+            # Status is a query and clears the firmware error state. Its reply
+            # can include the previous error rather than a bare command ack.
+            if command == "status" and (
+                response.startswith("PowerShield > ack status")
+                or response in {"ok", "PowerShield > ok"}
+                or self._is_device_error(response)
+            ):
+                return True
+            if self._is_device_error(response):
+                print(f"Command failed: {response}")
+                return False
 
-            if expected_response:
+            if expected_response is not None:
                 if response == expected_response:
                     return True
-                else:
-                    return False
-
-            response = response.split("PowerShield > ack ")
-            try:
-                if response[1] == command:
+                if response.startswith("PowerShield > ack ") and response.endswith(command):
                     return True
-            except IndexError:
-                return False
+                if "Acquisition completed" in response:
+                    return True
+                continue
+
+            if response.startswith("PowerShield > ack ") and response.endswith(command):
+                return True
+
+            if response in {"end", "PowerShield > Acquisition completed"}:
+                continue
 
         return False
 
@@ -245,13 +281,19 @@ class LPM01A:
             raise NotImplementedError
             self.send_command_wait_for_response(f"format bin_hexa")
             
+        # Static mode is required for high-current measurements. Dynamic mode is only
+        # suitable for low-current waveform tracking and saturates/limits current above ~50 mA.
         self.send_command_wait_for_response("acqmode stat")
-        # sleep  2 seconds to make sure that the acquisition mode is set before setting the acquisition time
+        if not self.send_command_wait_for_response("pwrend on"):
+            raise RuntimeError("Device did not acknowledge pwrend on")
         sleep(2)
-        self.send_command_wait_for_response("acqtime 1s")
+
+        # The board rejects time-suffixed commands such as "1s". For static acquisition,
+        # set a numeric acquisition time value; 0 means the board uses the static measurement
+        # mode semantics and waits for a completed capture cycle.
+        self.send_command_wait_for_response(f"acqtime {int(duration)}")
         self.send_command_wait_for_response(f"volt {voltage}m")
         self.send_command_wait_for_response(f"freq {freq}")
-        self.send_command_wait_for_response(f"acqtime {duration}")
 
     def start_capture(self, num_samples: int = None, delay_between_samples: float = 0.1) -> None:
         """
@@ -267,10 +309,9 @@ class LPM01A:
                                          Default is 0.1 seconds.
         """
         print(f"Starting capture, printing info every {self.print_info_every_ms} ms")
-        self.send_command_wait_for_response("pwr on")
-        sleep(5)
-        
-        # Set capture start time
+
+        # Power-on is managed by the caller so the board is not powered on twice.
+        # The measurement process assumes the board is already in the powered state.
         self.capture_start_us = int(self.uc.s_to_us(time()))
         
         # Static mode: capture specific number of samples
@@ -292,26 +333,90 @@ class LPM01A:
         else:
             self.send_command_wait_for_response("start")
 
-    def capture_single_sample(self) -> bool:
+    def capture_static_for(self, duration_s: float) -> None:
+        """Repeat static acquisitions for a host-timed interval.
+
+        Static mode produces one sample per start; frequency does not control
+        its cadence. Serial timeouts and final cleanup can extend the interval.
+        """
+        if duration_s <= 0:
+            raise ValueError("duration_s must be greater than zero")
+        if self.mode != "ascii":
+            raise NotImplementedError
+        self.capture_start_us = int(self.uc.s_to_us(time()))
+        deadline = monotonic() + duration_s
+        print(f"Capturing repeated static measurements for {duration_s} seconds...")
+        while monotonic() < deadline:
+            if not self.capture_single_sample(deadline=deadline):
+                break
+
+    def capture_single_sample(
+        self, deadline: float = None, max_retries: int = 3, retry_delay_s: float = 0.5
+    ) -> bool:
+        """Capture a valid static sample, retrying only current-stability failures.
+
+        Failed attempts stop acquisition and clear status without releasing
+        host control or cycling target power. Up to three
+        retries follow the initial attempt by default. The optional monotonic
+        deadline includes recovery and settling delays.
+        """
+        if not isinstance(max_retries, int) or max_retries < 0:
+            raise ValueError("max_retries must be a nonnegative integer")
+        if retry_delay_s < 0:
+            raise ValueError("retry_delay_s must be nonnegative")
+        for attempt in range(max_retries + 1):
+            try:
+                return self._capture_single_sample_attempt(deadline)
+            except StaticCurrentUnstableError as error:
+                print(error)
+                if not self.send_command_wait_for_response("status"):
+                    raise RuntimeError("Device did not respond to status; recovery stopped") from error
+                if attempt == max_retries:
+                    raise StaticCurrentUnstableError(
+                        f"Static current not constant after {attempt + 1} attempts; "
+                        "stabilize the target workload before capturing again."
+                    ) from error
+                delay = retry_delay_s
+                if deadline is not None:
+                    remaining = deadline - monotonic()
+                    if remaining <= delay:
+                        print("Capture interval ended before another static retry could start.")
+                        return False
+                print(f"Retrying static measurement {attempt + 1}/{max_retries} in {delay}s...")
+                sleep(delay)
+
+    def _capture_single_sample_attempt(self, deadline: float = None) -> bool:
         """
         Captures a single sample in static mode.
-        Starts a measurement, reads one sample, and writes it to CSV.
-        
+        Starts a measurement, reads one sample, writes it to CSV, then finalizes the
+        board state before another `start` is issued.
+
         Returns:
             bool: True if sample was successfully captured, False otherwise.
         """
-        self.send_command_wait_for_response("start")
-        success = self._read_and_parse_ascii_single_sample()
-        return success
+        timeout_s = 5 if deadline is None else min(5, deadline - monotonic())
+        if timeout_s <= 0:
+            return False
+        completed = False
+        try:
+            if not self.send_command_wait_for_response("start", timeout_s=timeout_s):
+                raise RuntimeError("Device did not acknowledge start")
+            remaining_s = 30 if deadline is None else max(0, deadline - monotonic())
+            completed = self._read_and_parse_ascii_single_sample(timeout_s=remaining_s)
+            return completed
+        finally:
+            if not completed:
+                self.stop_capture()
 
     def stop_capture(self) -> None:
         """
         Stops the capture of the LPM01A device.
+
+        Retains host control and the configured target power state. Releasing
+        control here would hand power/configuration back to standalone mode.
         """
-        self.send_command_wait_for_response(
-            "stop", expected_response="PowerShield > Acquisition completed"
-        )
-        self.send_command_wait_for_response("hrc")
+        if not self.send_command_wait_for_response("stop"):
+            raise RuntimeError("Capture cleanup failed: stop was not acknowledged")
 
     def deinit_capture(self) -> None:
         """
@@ -320,12 +425,16 @@ class LPM01A:
         self.csv_writer.close()
         self.serial_comm.close_serial()
 
-    def read_and_parse_data(self) -> None:
+    def read_and_parse_data(self, duration_s: float = None) -> None:
         """
-        Reads and parses the data from the LPM01A device.
+        Reads and saves samples, indefinitely or for the given duration in seconds.
+
+        A pending serial read can extend the duration by up to the serial timeout.
         """
+        if duration_s is not None and duration_s <= 0:
+            raise ValueError("duration_s must be greater than zero")
         self.capture_start_us = int(self.uc.s_to_us(time()))
         if self.mode == "ascii":
-            self._read_and_parse_ascii()
+            self._read_and_parse_ascii(duration_s=duration_s)
         else:
             raise NotImplementedError

@@ -33,7 +33,9 @@ class SerialCommunication:
 
     def send_data(self, data: str) -> None:
         """Sends the given data to the device."""
-        self.ser.write((data + "\n").encode())
+        payload = (data + "\n").encode()
+        print(f"[TX] {data}")
+        self.ser.write(payload)
 
     def receive_data(self) -> str:
         """Receives data from the device.
@@ -42,6 +44,8 @@ class SerialCommunication:
             str: The received data from the device.
         """
         response = self.ser.readline().decode().strip()
+        if response:
+            print(f"[RX] {response}")
         return response
 
     def receive_data_raw(self, num_bytes: int) -> bytes:

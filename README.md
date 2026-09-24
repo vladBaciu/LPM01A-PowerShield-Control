@@ -40,6 +40,22 @@ lpm.read_and_parse_data()
 
 See [data_acquisition.py](data_acquisition.py) for a complete example.
 
+Timed static capture repeats individual measurements for `MEASURE_FOR_SECONDS`.
+Initialization sends `pwrend on` to keep the target powered after acquisitions.
+If the device reports `Static acquisition: current not constant`, the failed
+reading is discarded and the driver sends `stop` and `status` before
+waiting 0.5 seconds and retrying. Each measurement allows up to three retries;
+the timed capture deadline can end retries sooner. Other device errors or
+unacknowledged cleanup commands stop capture. Valid samples already saved are
+preserved when the CSV closes. Successful measurements are saved only after
+`PowerShield > Acquisition completed`; the next `start` is sent without
+`stop`, `hrc`, or `htc`. Host control is retained throughout capture to avoid
+handing power and configuration back to standalone mode.
+
+Keep the target workload stable before starting capture and throughout the
+measurement. Retries handle temporary disturbances; they do not relax the
+device's static-current stability requirement.
+
 ### DataAnalysis
 
 ```python
